@@ -1,4 +1,4 @@
-#!env python
+#!/usr/bin/python
 # -*- coding: utf-8 -*-
 
 import sys
@@ -20,7 +20,8 @@ from datetime import datetime
 from std_msgs.msg import Header
 from sensor_msgs.msg import CameraInfo, Imu, PointField, NavSatFix
 import sensor_msgs.point_cloud2 as pcl2
-from geometry_msgs.msg import TransformStamped, TwistStamped, Transform
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, TransformStamped, TwistStamped, Transform
 from cv_bridge import CvBridge
 import numpy as np
 import argparse
@@ -81,6 +82,8 @@ def save_dynamic_tf(bag, kitti_type, kitti, initial_time):
 
     elif kitti_type.find("odom") != -1:
         timestamps = map(lambda x: initial_time + x.total_seconds(), kitti.timestamps)
+        odom = Odometry()
+        seq_id = 0
         for timestamp, tf_matrix in zip(timestamps, kitti.poses):
             tf_msg = TFMessage()
             tf_stamped = TransformStamped()
@@ -105,7 +108,19 @@ def save_dynamic_tf(bag, kitti_type, kitti, initial_time):
             tf_msg.transforms.append(tf_stamped)
 
             bag.write('/tf', tf_msg, tf_msg.transforms[0].header.stamp)
-          
+
+            # Publishing odometry info            
+            odom.header.stamp = tf_stamped.header.stamp
+            odom.header.frame_id = "camera_init"
+            odom.child_frame_id = "camera_gray_left"
+            odom.header.seq = seq_id
+            seq_id += 1
+
+            # set the position
+            odom.pose.pose = Pose(Point(t[0], t[1], t[2]), Quaternion(*q))
+            odom.twist.twist = Twist(Vector3(0, 0, 0), Vector3(0, 0, 0))
+            bag.write('/kitti/gtruth', odom, odom.header.stamp)
+
         
 def save_camera_data(bag, kitti_type, kitti, util, bridge, camera, camera_frame_id, topic, initial_time):
     print("Exporting camera {}".format(camera))
@@ -134,7 +149,11 @@ def save_camera_data(bag, kitti_type, kitti, util, bridge, camera, camera_frame_
         
         calib = CameraInfo()
         calib.header.frame_id = camera_frame_id
-        calib.P = util['P{}'.format(camera_pad)]
+        #calib.P = util['P{}'.format(camera_pad)]
+        calib.distortion_model = 'plumb_bob'
+        if camera == 0:
+            calib.K = kitti.calib.K_cam0.flatten()
+        #calib.P = kitti.calib.P_rect_00.flatten()
     
     iterable = zip(image_datetimes, image_filenames)
     bar = progressbar.ProgressBar()
@@ -147,15 +166,18 @@ def save_camera_data(bag, kitti_type, kitti, util, bridge, camera, camera_frame_
         encoding = "mono8" if camera in (0, 1) else "bgr8"
         image_message = bridge.cv2_to_imgmsg(cv_image, encoding=encoding)
         image_message.header.frame_id = camera_frame_id
+        image_message.header.seq = calib.header.seq
+        calib.header.seq += 1
         if kitti_type.find("raw") != -1:
             image_message.header.stamp = rospy.Time.from_sec(float(datetime.strftime(dt, "%s.%f")))
             topic_ext = "/image"
         elif kitti_type.find("odom") != -1:
             image_message.header.stamp = rospy.Time.from_sec(dt)
             topic_ext = "/image"
+
         calib.header.stamp = image_message.header.stamp
         bag.write(topic + topic_ext, image_message, t = image_message.header.stamp)
-        bag.write(topic + '/camera_info', calib, t = calib.header.stamp) 
+        bag.write(topic + '/camera_info', calib, t = calib.header.stamp)
         
 def save_velo_data(bag, kitti_type, kitti, velo_frame_id, topic, initial_time):
     print("Exporting velodyne data")
@@ -178,6 +200,11 @@ def save_velo_data(bag, kitti_type, kitti, velo_frame_id, topic, initial_time):
 
     iterable = zip(velo_datetimes, velo_filenames)
     bar = progressbar.ProgressBar()
+    
+    # create header
+    header = Header()
+    header.frame_id = velo_frame_id
+    
     for dt, filename in bar(iterable):
         if dt is None:
             continue
@@ -187,9 +214,9 @@ def save_velo_data(bag, kitti_type, kitti, velo_frame_id, topic, initial_time):
         # read binary data
         scan = (np.fromfile(velo_filename, dtype=np.float32)).reshape(-1, 4)
 
-        # create header
-        header = Header()
-        header.frame_id = velo_frame_id
+        # Updating sequence number
+        header.seq += 1
+        
         if kitti_type.find("raw") != -1:
             header.stamp = rospy.Time.from_sec(float(datetime.strftime(dt, "%s.%f")))
         elif kitti_type.find("odom") != -1:
@@ -232,7 +259,7 @@ def inv(transform):
     return transform_inv
 
 
-def save_static_transforms(bag, kitti_type, transforms, timestamps):
+def save_static_transforms(bag, kitti_type, transforms, timestamps, onlygray=False):
     print("Exporting static transformations")
     tfm = TFMessage()
     for transform in transforms:
@@ -243,12 +270,14 @@ def save_static_transforms(bag, kitti_type, transforms, timestamps):
             time = rospy.Time.from_sec(float(t.strftime("%s.%f")))
             for tf in tfm.transforms:
                 tf.header.stamp = time
+                #tf.header.seq += 1
             bag.write('/tf_static', tfm, t=time)
     elif kitti_type.find("odom") != -1:
         for t in timestamps:
             time = rospy.Time.from_sec(t)
             for tf in tfm.transforms:
                 tf.header.stamp = time
+                #tf.header.seq += 1
             bag.write('/tf_static', tfm, t=time)
 
 
@@ -291,20 +320,22 @@ def run_kitti2bag():
     parser.add_argument("-t", "--date", help = "date of the raw dataset (i.e. 2011_09_26), option is only for RAW datasets.")
     parser.add_argument("-r", "--drive", help = "drive number of the raw dataset (i.e. 0001), option is only for RAW datasets.")
     parser.add_argument("-s", "--sequence", choices = odometry_sequences,help = "sequence of the odometry dataset (between 00 - 21), option is only for ODOMETRY datasets.")
+    parser.add_argument("-g", "--only_gray", default=False, action="store_true", help = "just extract gray scale images (cameras 0 and 1).")
     args = parser.parse_args()
 
     bridge = CvBridge()
-    compression = rosbag.Compression.NONE
+    # compression = rosbag.Compression.NONE
     # compression = rosbag.Compression.BZ2
-    # compression = rosbag.Compression.LZ4
+    compression = rosbag.Compression.LZ4
     
     # CAMERAS
-    cameras = [
+    cameras_all = [
         (0, 'camera_gray_left', '/kitti/camera_gray_left'),
         (1, 'camera_gray_right', '/kitti/camera_gray_right'),
         (2, 'camera_color_left', '/kitti/camera_color_left'),
         (3, 'camera_color_right', '/kitti/camera_color_right')
     ]
+    cameras = cameras_all
 
     if args.kitti_type.find("raw") != -1:
     
@@ -372,6 +403,10 @@ def run_kitti2bag():
             print("Sequence option is not given. It is mandatory for odometry dataset.")
             print("Usage for odometry dataset: kitti2bag {odom} [dir] -s <sequence>")
             sys.exit(1)
+        
+        onlygray = args.only_gray
+        if onlygray:
+            print("Extracting only gray images.")
             
         bag = rosbag.Bag("kitti_odometry_sequence_{}.bag".format(args.sequence), 'w', compression=compression)
         
@@ -391,27 +426,51 @@ def run_kitti2bag():
             velo_frame_id = 'velo_link'
             velo_topic = '/kitti/velo'
 
-            transforms = [
-                ('world', 'velo_init', np.eye(4, 4)),
-                ('world', 'camera_init', inv(kitti.calib.T_cam0_velo)),
-                (cameras[0][1], velo_frame_id, kitti.calib.T_cam0_velo),
-                (cameras[0][1], cameras[1][1], kitti.calib.T_cam0_velo.dot(inv(kitti.calib.T_cam1_velo))),
-                (cameras[0][1], cameras[2][1], kitti.calib.T_cam0_velo.dot(inv(kitti.calib.T_cam2_velo))),
-                (cameras[0][1], cameras[3][1], kitti.calib.T_cam0_velo.dot(inv(kitti.calib.T_cam3_velo)))
+            #transforms = [
+            #    ('world', 'velo_init', np.eye(4, 4)),
+            #    ('world', 'camera_init', inv(kitti.calib.T_cam0_velo)),
+            #    (cameras[0][1], velo_frame_id, kitti.calib.T_cam0_velo),
+            #    (cameras[0][1], cameras[1][1], kitti.calib.T_cam0_velo.dot(inv(kitti.calib.T_cam1_velo))),
+            #    (cameras[0][1], cameras[2][1], kitti.calib.T_cam0_velo.dot(inv(kitti.calib.T_cam2_velo))),
+            #    (cameras[0][1], cameras[3][1], kitti.calib.T_cam0_velo.dot(inv(kitti.calib.T_cam3_velo)))
+            #]
+
+            transforms_all = [
+               ('world', 'camera_init', inv(kitti.calib.T_cam0_velo)),
+               (cameras[0][1], velo_frame_id, kitti.calib.T_cam0_velo),
+               (cameras[0][1], cameras[1][1], kitti.calib.T_cam0_velo.dot(inv(kitti.calib.T_cam1_velo))),
+               (cameras[0][1], cameras[2][1], kitti.calib.T_cam0_velo.dot(inv(kitti.calib.T_cam2_velo))),
+               (cameras[0][1], cameras[3][1], kitti.calib.T_cam0_velo.dot(inv(kitti.calib.T_cam3_velo)))
             ]
+            transforms = transforms_all
+            
+            # Adjusting transforms and cameras if it is only gray
+            if onlygray:
+                transforms = transforms_all[:-2]
+                cameras = cameras_all[:-2]
 
             util = pykitti.utils.read_calib_file(os.path.join(args.dir,'sequences',args.sequence, 'calib.txt'))
             current_epoch = (datetime.utcnow() - datetime(1970, 1, 1)).total_seconds()
-            timestamps = map(lambda x: current_epoch + x.total_seconds(),kitti.timestamps)
+            timestamps = map(lambda x: current_epoch + x.total_seconds(), kitti.timestamps)
 
             # Export
+            # Static transformations
             save_static_transforms(bag, args.kitti_type, transforms, timestamps)
+
+            # Dynamic transformations
             save_dynamic_tf(bag, args.kitti_type, kitti, initial_time=current_epoch)
-            for cameras in cameras:
-                save_camera_data(bag, args.kitti_type, kitti, util, bridge, camera = cameras[0], camera_frame_id = cameras[1], topic=cameras[2], initial_time=current_epoch)
+
+            # Camera data
+            for camera in cameras:
+                save_camera_data(bag, args.kitti_type, kitti, util, bridge, camera = camera[0], camera_frame_id = camera[1], topic=camera[2], initial_time=current_epoch)
+
+            # Velodyne pointclouds    
             save_velo_data(bag, args.kitti_type, kitti, velo_frame_id, velo_topic, initial_time=current_epoch)
 
         finally:
             print("## OVERVIEW ##")
             print(bag)
             bag.close()
+
+if __name__ == "__main__":
+    run_kitti2bag()
