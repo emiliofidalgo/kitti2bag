@@ -28,11 +28,14 @@ import argparse
 
 def save_imu_data(bag, kitti, imu_frame_id, topic):
     print("Exporting IMU")
+    seq_id = 0
     for timestamp, oxts in zip(kitti.timestamps, kitti.oxts):
         q = tf.transformations.quaternion_from_euler(oxts.packet.roll, oxts.packet.pitch, oxts.packet.yaw)
         imu = Imu()
         imu.header.frame_id = imu_frame_id
         imu.header.stamp = rospy.Time.from_sec(float(timestamp.strftime("%s.%f")))
+        imu.header.seq = seq_id
+        seq_id += 1
         imu.orientation.x = q[0]
         imu.orientation.y = q[1]
         imu.orientation.z = q[2]
@@ -49,6 +52,8 @@ def save_imu_data(bag, kitti, imu_frame_id, topic):
 def save_dynamic_tf(bag, kitti_type, kitti, initial_time):
     print("Exporting time dependent transformations")
     if kitti_type.find("raw") != -1:
+        odom = Odometry()
+        seq_id = 0
         for timestamp, oxts in zip(kitti.timestamps, kitti.oxts):
             tf_oxts_msg = TFMessage()
             tf_oxts_transform = TransformStamped()
@@ -79,6 +84,18 @@ def save_dynamic_tf(bag, kitti_type, kitti, initial_time):
             tf_oxts_msg.transforms.append(tf_oxts_transform)
 
             bag.write('/tf', tf_oxts_msg, tf_oxts_msg.transforms[0].header.stamp)
+
+            # Publishing odometry info            
+            odom.header.stamp = tf_oxts_transform.header.stamp 
+            odom.header.frame_id = "world"
+            odom.child_frame_id = "base_link"
+            odom.header.seq = seq_id
+            seq_id += 1
+
+            # set the position
+            odom.pose.pose = Pose(Point(t[0], t[1], t[2]), Quaternion(*q))
+            odom.twist.twist = Twist(Vector3(0, 0, 0), Vector3(0, 0, 0))
+            bag.write('/kitti/gtruth', odom, odom.header.stamp)
 
     elif kitti_type.find("odom") != -1:
         timestamps = map(lambda x: initial_time + x.total_seconds(), kitti.timestamps)
@@ -282,10 +299,13 @@ def save_static_transforms(bag, kitti_type, transforms, timestamps, onlygray=Fal
 
 
 def save_gps_fix_data(bag, kitti, gps_frame_id, topic):
+    seq_id = 0
     for timestamp, oxts in zip(kitti.timestamps, kitti.oxts):
         navsatfix_msg = NavSatFix()
         navsatfix_msg.header.frame_id = gps_frame_id
         navsatfix_msg.header.stamp = rospy.Time.from_sec(float(timestamp.strftime("%s.%f")))
+        navsatfix_msg.header.seq = seq_id
+        seq_id += 1
         navsatfix_msg.latitude = oxts.packet.lat
         navsatfix_msg.longitude = oxts.packet.lon
         navsatfix_msg.altitude = oxts.packet.alt
@@ -294,10 +314,13 @@ def save_gps_fix_data(bag, kitti, gps_frame_id, topic):
 
 
 def save_gps_vel_data(bag, kitti, gps_frame_id, topic):
+    seq_id = 0
     for timestamp, oxts in zip(kitti.timestamps, kitti.oxts):
         twist_msg = TwistStamped()
         twist_msg.header.frame_id = gps_frame_id
         twist_msg.header.stamp = rospy.Time.from_sec(float(timestamp.strftime("%s.%f")))
+        twist_msg.header.seq = seq_id
+        seq_id += 1
         twist_msg.twist.linear.x = oxts.packet.vf
         twist_msg.twist.linear.y = oxts.packet.vl
         twist_msg.twist.linear.z = oxts.packet.vu
@@ -348,8 +371,14 @@ def run_kitti2bag():
             print("Usage for raw dataset: kitti2bag raw_sync [dir] -t <date> -r <drive>")
             sys.exit(1)
         
+        onlygray = args.only_gray
+        if onlygray:
+            print("Extracting only gray images.")
+        
         bag = rosbag.Bag("kitti_{}_drive_{}_{}.bag".format(args.date, args.drive, args.kitti_type[4:]), 'w', compression=compression)
+        
         kitti = pykitti.raw(args.dir, args.date, args.drive)
+        
         if not os.path.exists(kitti.data_path):
             print('Path {} does not exists. Exiting.'.format(kitti.data_path))
             sys.exit(1)
@@ -371,7 +400,7 @@ def run_kitti2bag():
             T_base_link_to_imu[0:3, 3] = [-2.71/2.0-0.05, 0.32, 0.93]
 
             # tf_static
-            transforms = [
+            transforms_all = [
                 ('base_link', imu_frame_id, T_base_link_to_imu),
                 (imu_frame_id, velo_frame_id, inv(kitti.calib.T_velo_imu)),
                 (imu_frame_id, cameras[0][1], inv(kitti.calib.T_cam0_imu)),
@@ -379,6 +408,12 @@ def run_kitti2bag():
                 (imu_frame_id, cameras[2][1], inv(kitti.calib.T_cam2_imu)),
                 (imu_frame_id, cameras[3][1], inv(kitti.calib.T_cam3_imu))
             ]
+            transforms = transforms_all
+
+            # Adjusting transforms and cameras if it is only gray
+            if onlygray:
+                transforms = transforms_all[:-2]
+                cameras = cameras_all[:-2]
 
             util = pykitti.utils.read_calib_file(os.path.join(kitti.calib_path, 'calib_cam_to_cam.txt'))
 
