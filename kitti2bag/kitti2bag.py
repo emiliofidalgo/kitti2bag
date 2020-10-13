@@ -20,8 +20,8 @@ from datetime import datetime
 from std_msgs.msg import Header
 from sensor_msgs.msg import CameraInfo, Imu, PointField, NavSatFix
 import sensor_msgs.point_cloud2 as pcl2
-from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, TransformStamped, TwistStamped, Transform
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion, Twist, Vector3, TransformStamped, TwistStamped, Transform
 from cv_bridge import CvBridge
 import numpy as np
 import argparse
@@ -53,6 +53,7 @@ def save_dynamic_tf(bag, kitti_type, kitti, initial_time):
     print("Exporting time dependent transformations")
     if kitti_type.find("raw") != -1:
         odom = Odometry()
+        path = Path()
         seq_id = 0
         for timestamp, oxts in zip(kitti.timestamps, kitti.oxts):
             tf_oxts_msg = TFMessage()
@@ -91,15 +92,34 @@ def save_dynamic_tf(bag, kitti_type, kitti, initial_time):
             odom.child_frame_id = "base_link"
             odom.header.seq = seq_id
             seq_id += 1
-
-            # set the position
+            
             odom.pose.pose = Pose(Point(t[0], t[1], t[2]), Quaternion(*q))
             odom.twist.twist = Twist(Vector3(0, 0, 0), Vector3(0, 0, 0))
-            bag.write('/kitti/gtruth', odom, odom.header.stamp)
+            bag.write('/kitti/gtruth/odom', odom, odom.header.stamp)
+
+            # Publishing path
+            pose = PoseStamped()            
+            pose.header.frame_id = "world"
+            pose.pose.position.x = float(odom.pose.pose.position.x)
+            pose.pose.position.y = float(odom.pose.pose.position.y)
+            pose.pose.position.z = float(odom.pose.pose.position.z)
+            pose.pose.orientation.x = float(odom.pose.pose.orientation.x)
+            pose.pose.orientation.y = float(odom.pose.pose.orientation.y)
+            pose.pose.orientation.z = float(odom.pose.pose.orientation.z)
+            pose.pose.orientation.w = float(odom.pose.pose.orientation.w)
+
+            pose.header.seq = odom.header.seq
+            path.header.frame_id = "world"
+            path.header.stamp = odom.header.stamp
+            pose.header.stamp = path.header.stamp
+            path.poses.append(pose)
+            bag.write('/kitti/gtruth/path', path, path.header.stamp)
+
 
     elif kitti_type.find("odom") != -1:
         timestamps = map(lambda x: initial_time + x.total_seconds(), kitti.timestamps)
         odom = Odometry()
+        path = Path()
         seq_id = 0
         for timestamp, tf_matrix in zip(timestamps, kitti.poses):
             tf_msg = TFMessage()
@@ -136,7 +156,25 @@ def save_dynamic_tf(bag, kitti_type, kitti, initial_time):
             # set the position
             odom.pose.pose = Pose(Point(t[0], t[1], t[2]), Quaternion(*q))
             odom.twist.twist = Twist(Vector3(0, 0, 0), Vector3(0, 0, 0))
-            bag.write('/kitti/gtruth', odom, odom.header.stamp)
+            bag.write('/kitti/gtruth/odom', odom, odom.header.stamp)
+
+            # Publishing path
+            pose = PoseStamped()            
+            pose.header.frame_id = "camera_init"
+            pose.pose.position.x = float(odom.pose.pose.position.x)
+            pose.pose.position.y = float(odom.pose.pose.position.y)
+            pose.pose.position.z = float(odom.pose.pose.position.z)
+            pose.pose.orientation.x = float(odom.pose.pose.orientation.x)
+            pose.pose.orientation.y = float(odom.pose.pose.orientation.y)
+            pose.pose.orientation.z = float(odom.pose.pose.orientation.z)
+            pose.pose.orientation.w = float(odom.pose.pose.orientation.w)
+
+            pose.header.seq = odom.header.seq
+            path.header.frame_id = "camera_init"
+            path.header.stamp = odom.header.stamp
+            pose.header.stamp = path.header.stamp
+            path.poses.append(pose)
+            bag.write('/kitti/gtruth/path', path, path.header.stamp)
 
         
 def save_camera_data(bag, kitti_type, kitti, util, bridge, camera, camera_frame_id, topic, initial_time):
